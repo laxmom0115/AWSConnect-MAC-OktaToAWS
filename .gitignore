@@ -1,0 +1,15 @@
+# CDK build output
+dist/
+*.d.ts
+*.js
+!jest.config.js
+!cdk.out/
+cdk.out/
+
+# Node modules
+node_modules/
+lambda/connect-provisioner/node_modules/
+lambda/connect-provisioner/dist/
+
+# AWS CDK staging
+.cdk.staging/

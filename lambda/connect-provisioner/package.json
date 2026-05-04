@@ -1,0 +1,21 @@
+{
+  "name": "connect-provisioner",
+  "version": "0.1.0",
+  "description": "Lambda handler for Okta → Amazon Connect user provisioning",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.0",
+    "@types/node": "20.x",
+    "typescript": "~5.4.0"
+  }
+}
