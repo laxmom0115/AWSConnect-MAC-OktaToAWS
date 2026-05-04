@@ -301,16 +301,23 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
+    const isConfigError =
+      err instanceof Error && (err.message.includes('SSM') || err.message.includes('Missing'));
+
     console.error('[connect-provisioner] Error processing event', { mac, role, action, message });
+
+    if (isConfigError) {
+      // Config/setup errors are permanent — return 200 so Okta does not retry
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ ...responseBase, message: 'Configuration error — check SSM/Secrets', error: message }),
+      };
+    }
+
+    // Transient errors (e.g., AWS SDK throttle) return 500 so Okta retries the hook
     return {
-      statusCode: 200, // return 200 to prevent Okta from treating as hook failure
-      body: JSON.stringify({ ...responseBase, message: 'Internal error — logged', error: message }),
+      statusCode: 500,
+      body: JSON.stringify({ message: 'Transient error — please retry', error: message }),
     };
   }
 }
-
-// ── Unused SDK reference (prevents dead-code warnings; will be used in TODOs) ─
-void OKTA_BASE_URL;
-void OKTA_API_TOKEN_SECRET_ARN;
-void secretsClient;
-void ssmClient;

@@ -78,6 +78,9 @@ export class ConnectProvisioningStack extends cdk.Stack {
         SSM_CONFIG_PREFIX: '/connect/macs/',
         STATE_TABLE_NAME: stateTable.tableName,
         OKTA_API_TOKEN_SECRET_ARN: oktaTokenSecret.secretArn,
+        // Empty by default; set a real value post-deployment via the AWS console or
+        // `aws lambda update-function-configuration` to enable shared-secret validation.
+        // See README.md section 7 for instructions.
         OKTA_SHARED_SECRET: '',
       },
       description: 'Handles Okta Event Hook webhook to provision/deprovision Amazon Connect users',
