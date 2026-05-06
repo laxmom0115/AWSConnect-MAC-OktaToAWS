@@ -182,7 +182,6 @@ aws lambda update-function-configuration \
   --function-name connect-webhook-receiver \
   --environment "Variables={
     OKTA_SHARED_SECRET=<YOUR_SHARED_SECRET>,
-    OKTA_BASE_URL=https://cms.okta.com,
     PROVISIONING_QUEUE_URL=<QUEUE_URL_FROM_STACK_OUTPUT>
   }"
 ```

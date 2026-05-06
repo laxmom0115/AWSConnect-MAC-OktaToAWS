@@ -5,7 +5,6 @@ import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 const sqsClient = new SQSClient({});
 
 // ── Environment variables ─────────────────────────────────────────────────────
-const OKTA_BASE_URL = process.env.OKTA_BASE_URL ?? 'https://cms.okta.com';
 const PROVISIONING_QUEUE_URL = process.env.PROVISIONING_QUEUE_URL ?? '';
 const OKTA_SHARED_SECRET = process.env.OKTA_SHARED_SECRET ?? '';
 
@@ -193,7 +192,3 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     body: JSON.stringify({ ...responseBase, message: 'Event accepted' }),
   };
 }
-
-// OKTA_BASE_URL is referenced only to satisfy the env-var pattern used across both
-// Lambda packages and to allow future use (e.g., Okta verification challenge response).
-void OKTA_BASE_URL;

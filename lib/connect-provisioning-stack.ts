@@ -105,7 +105,6 @@ export class ConnectProvisioningStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(10),
       memorySize: 256,
       environment: {
-        OKTA_BASE_URL: 'https://cms.okta.com',
         PROVISIONING_QUEUE_URL: provisioningQueue.queueUrl,
         // Empty by default; set a real value post-deployment via the AWS console or
         // `aws lambda update-function-configuration` to enable shared-secret validation.

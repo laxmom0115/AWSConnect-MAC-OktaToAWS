@@ -90,7 +90,8 @@ async function fetchOktaUser(oktaUserId: string, token: string): Promise<OktaUse
     headers: { Authorization: `SSWS ${token}`, Accept: 'application/json' },
   });
   if (!res.ok) {
-    throw new Error(`Okta API GET /users/${oktaUserId} returned ${res.status}`);
+    const text = await res.text().catch(() => '');
+    throw new Error(`Okta API GET /users/${oktaUserId} returned ${res.status}: ${text}`);
   }
   const body = await res.json() as { profile: OktaUserProfile };
   return body.profile;
