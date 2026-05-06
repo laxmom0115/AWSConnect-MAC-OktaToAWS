@@ -8,17 +8,53 @@ See [`Amazon-Connect-Okta-Provisioning-Blueprint.md`](./Amazon-Connect-Okta-Prov
 
 ---
 
+## Architecture overview
+
+```
+Okta Event Hook
+    │  POST /okta/connect-provision
+    ▼
+API Gateway
+    │
+    ▼
+connect-webhook-receiver (Lambda)
+  • Validates shared secret
+  • Parses Okta group membership event
+  • Enqueues ProvisioningTask to SQS
+  • Returns HTTP 200 immediately (< 1 s)
+    │
+    ▼
+connect-provisioning-queue (SQS)
+  • Visibility timeout: 35 s
+  • DLQ: connect-provisioning-dlq (3 retries, 14-day retention)
+    │
+    ▼
+connect-provisioner-worker (Lambda, SQS consumer)
+  • Fetches Okta user profile (Okta API)
+  • Loads MAC config (SSM)
+  • Creates / updates / disables user (Amazon Connect API)
+  • Writes provisioning state (DynamoDB)
+```
+
+The two-Lambda design ensures the webhook receiver always responds to Okta within its ~3-second timeout window, while the worker handles the longer AWS API calls with full SQS retry semantics.
+
+---
+
 ## Repository structure
 
 ```
 .
 ├── bin/
-│   └── app.ts                         # CDK entry point
+│   └── app.ts                                  # CDK entry point
 ├── lib/
-│   └── connect-provisioning-stack.ts  # CDK stack definition
+│   └── connect-provisioning-stack.ts           # CDK stack definition
 ├── lambda/
-│   └── connect-provisioner/
-│       ├── index.ts                   # Lambda handler (TypeScript)
+│   ├── connect-provisioner/
+│   │   ├── index.ts                            # Webhook receiver Lambda (TypeScript)
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   └── connect-provisioner-worker/
+│       ├── index.ts                            # SQS worker Lambda (TypeScript)
 │       ├── package.json
 │       └── tsconfig.json
 ├── cdk.json
@@ -54,8 +90,11 @@ npm install -g aws-cdk
 # CDK + infrastructure packages
 npm install
 
-# Lambda packages
+# Webhook receiver Lambda packages
 cd lambda/connect-provisioner && npm install && cd ../..
+
+# Worker Lambda packages
+cd lambda/connect-provisioner-worker && npm install && cd ../..
 ```
 
 ### 2 – Bootstrap CDK (first-time only per AWS account/region)
@@ -81,9 +120,11 @@ The deployment takes ~2 minutes. On completion, CDK prints the key stack outputs
 
 ```
 Outputs:
-ConnectProvisioningStack.ApiEndpoint           = https://<id>.execute-api.us-east-1.amazonaws.com/prod/okta/connect-provision
-ConnectProvisioningStack.StateTableName        = connect-provisioning-state
-ConnectProvisioningStack.OktaTokenSecretArn    = arn:aws:secretsmanager:us-east-1:...:secret:okta/api-token-...
+ConnectProvisioningStack.ApiEndpoint             = https://<id>.execute-api.us-east-1.amazonaws.com/prod/okta/connect-provision
+ConnectProvisioningStack.StateTableName          = connect-provisioning-state
+ConnectProvisioningStack.OktaTokenSecretArn      = arn:aws:secretsmanager:us-east-1:...:secret:okta/api-token-...
+ConnectProvisioningStack.ProvisioningQueueUrl    = https://sqs.us-east-1.amazonaws.com/<account>/connect-provisioning-queue
+ConnectProvisioningStack.ProvisioningDlqUrl      = https://sqs.us-east-1.amazonaws.com/<account>/connect-provisioning-dlq
 ```
 
 Copy the `ApiEndpoint` URL — you will need it when configuring the Okta Event Hook.
@@ -138,13 +179,11 @@ Set `OKTA_SHARED_SECRET` as a Lambda environment variable so the handler validat
 
 ```bash
 aws lambda update-function-configuration \
-  --function-name connect-provisioner \
+  --function-name connect-webhook-receiver \
   --environment "Variables={
     OKTA_SHARED_SECRET=<YOUR_SHARED_SECRET>,
     OKTA_BASE_URL=https://cms.okta.com,
-    SSM_CONFIG_PREFIX=/connect/macs/,
-    STATE_TABLE_NAME=connect-provisioning-state,
-    OKTA_API_TOKEN_SECRET_ARN=<ARN_FROM_STACK_OUTPUT>
+    PROVISIONING_QUEUE_URL=<QUEUE_URL_FROM_STACK_OUTPUT>
   }"
 ```
 
@@ -183,10 +222,11 @@ Expected response:
   "groupName": "connect_noridian_agent",
   "mac": "noridian",
   "role": "agent",
-  "message": "ADDED event processed (stub)",
-  "connectUsername": "PLACEHOLDER_00u1test000USER"
+  "message": "Event accepted"
 }
 ```
+
+The receiver enqueues the task to SQS and returns immediately. The worker Lambda processes the task asynchronously — check CloudWatch logs for `connect-provisioner-worker` to see the Connect API calls.
 
 ### Test with shared secret header
 
@@ -240,6 +280,40 @@ curl -s -X POST \
 
 ---
 
+## Monitoring failed provisioning tasks
+
+If the worker Lambda fails to process a task after 3 attempts, SQS moves it to the dead-letter queue (`connect-provisioning-dlq`).
+
+Inspect failed messages:
+
+```bash
+# Replace <dlq-url> with the ProvisioningDlqUrl stack output
+aws sqs receive-message \
+  --queue-url <dlq-url> \
+  --max-number-of-messages 10 \
+  --attribute-names All
+```
+
+To replay a failed message after fixing the underlying issue:
+
+```bash
+# 1. Receive the message (capture ReceiptHandle)
+MSG=$(aws sqs receive-message --queue-url <dlq-url> --max-number-of-messages 1)
+
+# 2. Re-send to the main queue
+aws sqs send-message \
+  --queue-url <main-queue-url> \
+  --message-body "$(echo $MSG | jq -r '.Messages[0].Body')" \
+  --message-group-id "$(echo $MSG | jq -r '.Messages[0].Body | fromjson | .mac')"
+
+# 3. Delete from DLQ
+aws sqs delete-message \
+  --queue-url <dlq-url> \
+  --receipt-handle "$(echo $MSG | jq -r '.Messages[0].ReceiptHandle')"
+```
+
+---
+
 ## Destroy / teardown
 
 ```bash
@@ -256,8 +330,11 @@ cdk destroy
 # Type-check CDK stack
 npx tsc --noEmit
 
-# Type-check Lambda handler
-cd lambda/connect-provisioner && npx tsc --noEmit
+# Type-check webhook receiver Lambda
+cd lambda/connect-provisioner && npx tsc --noEmit && cd ../..
+
+# Type-check worker Lambda
+cd lambda/connect-provisioner-worker && npx tsc --noEmit && cd ../..
 
 # Synthesize CDK template
 cdk synth

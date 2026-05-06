@@ -1,0 +1,23 @@
+{
+  "name": "connect-provisioner-worker",
+  "version": "0.1.0",
+  "description": "SQS worker Lambda — fetches Okta user profile, provisions/deprovisions Amazon Connect users, updates DynamoDB state",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "dependencies": {
+    "@aws-sdk/client-connect": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0",
+    "@aws-sdk/client-sqs": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.0",
+    "@types/node": "20.x",
+    "typescript": "~5.4.0"
+  }
+}

@@ -22,10 +22,12 @@ Automate the provisioning and deprovisioning of Amazon Connect users when a MAC-
 2. **Okta (cms.okta.com)**: receives/synchronizes user profile updates including job code; rules assign the user to an Okta group representing access.
 3. **Okta Event Hook** (or Okta Workflows): emits events on group membership changes.
 4. **AWS API Gateway (us-east-1)**: receives Okta webhook events.
-5. **AWS Lambda (us-east-1)**: validates event, fetches user details from Okta API, loads MAC config, provisions user in Amazon Connect, persists state.
-6. **Amazon Connect instance (noridian)**: target Connect instance where users are created/updated/disabled.
-7. **SSM Parameter Store**: stores per-MAC configuration (instance IDs, routing profile IDs, security profile IDs, usernameSource).
-8. **DynamoDB**: stores provisioning state for idempotency and audit.
+5. **AWS Lambda: `connect-webhook-receiver` (us-east-1)**: validates the Okta event and shared secret, parses the group membership event, and enqueues a provisioning task to SQS. Returns HTTP 200 to Okta within milliseconds.
+6. **Amazon SQS: `connect-provisioning-queue`**: buffers provisioning tasks and decouples the fast webhook receiver from the slow provisioning work. A DLQ (`connect-provisioning-dlq`) captures tasks that fail all retry attempts.
+7. **AWS Lambda: `connect-provisioner-worker` (us-east-1)**: SQS consumer. Fetches the authoritative user profile from the Okta API, loads MAC config from SSM, provisions or deprovisions the user in Amazon Connect, and persists state to DynamoDB.
+8. **Amazon Connect instance (noridian)**: target Connect instance where users are created/updated/disabled.
+9. **SSM Parameter Store**: stores per-MAC configuration (instance IDs, routing profile IDs, security profile IDs, usernameSource).
+10. **DynamoDB**: stores provisioning state for idempotency and audit. Streams are enabled for future audit/notification Lambda integration.
 
 ---
 
@@ -142,21 +144,31 @@ Security recommendation:
 - Require a shared secret header (e.g., `X-Okta-Secret`) validated by Lambda.
 - Optionally implement AWS WAF rules.
 
-### 7.2 Lambda: `connect-provisioner`
+### 7.2 Lambda: `connect-webhook-receiver`
 Responsibilities:
 1. Validate request (shared secret, basic schema).
 2. Determine action: ADDED or REMOVED.
 3. Identify the target Okta group and parse `(mac, role)` from group name.
-4. Fetch authoritative user profile from Okta API using Okta User ID.
-5. Load per-MAC configuration from SSM.
-6. Determine Connect username based on `usernameSource`:
+4. Enqueue a `ProvisioningTask` message to SQS (`connect-provisioning-queue`).
+5. Return HTTP 200 immediately (satisfies Okta's ~3 second timeout requirement).
+
+**Environment variables**: `OKTA_SHARED_SECRET`, `OKTA_BASE_URL`, `PROVISIONING_QUEUE_URL`.
+
+### 7.2a Lambda: `connect-provisioner-worker`
+Responsibilities:
+1. Receive `ProvisioningTask` messages from SQS (batch size 1, partial batch failure reporting).
+2. Fetch authoritative user profile from Okta API using Okta User ID.
+3. Load per-MAC configuration from SSM.
+4. Determine Connect username based on `usernameSource`:
    - If `email`: Connect Username = Okta `email`.
    - If `euaId`: Connect Username = Okta `euaId` (must exist).
-7. Upsert user into the correct Amazon Connect instance:
+5. Upsert user into the correct Amazon Connect instance:
    - Create if not present.
    - Update security profiles and routing profile if present.
-8. For REMOVED events, disable Connect user **only if** user is no longer in any `connect_{mac}_*` group (prevents disable during role transitions).
-9. Write/update provisioning state in DynamoDB for idempotency/audit.
+6. For REMOVED events, disable Connect user **only if** user is no longer in any `connect_{mac}_*` group (prevents disable during role transitions).
+7. Write/update provisioning state in DynamoDB for idempotency/audit.
+
+**Environment variables**: `OKTA_BASE_URL`, `SSM_CONFIG_PREFIX`, `STATE_TABLE_NAME`, `OKTA_API_TOKEN_SECRET_ARN`.
 
 ### 7.3 SSM Parameter Store configuration (per MAC)
 Parameter naming:
@@ -185,6 +197,15 @@ Value (JSON template):
 Table: `connect-provisioning-state`  
 Partition key: `pk` (string) = `{mac}#{connectUsername}`
 
+Global Secondary Index:
+- Index name: `oktaUserId-index`
+- Partition key: `oktaUserId` (string)
+- Projection: ALL
+- Rationale: enables reverse lookup — find all Connect users associated with a given Okta user ID without a full table scan.
+
+DynamoDB Streams: `NEW_AND_OLD_IMAGES`  
+Rationale: enables a future audit/notification Lambda to react to every state change (provisioned/disabled/errored) without polling.
+
 Recommended attributes:
 - `oktaUserId`
 - `mac`
@@ -195,13 +216,20 @@ Recommended attributes:
 - `status` (`PROVISIONED` | `DISABLED` | `ERROR`)
 - `updatedAt`
 
+Write pattern: `UpdateCommand` (partial attribute updates) rather than `PutCommand` (full overwrites). This prevents concurrent SQS message retries from overwriting attributes written by other in-flight messages for the same user.
+
 Rationale:
 - Prevent duplicate user creation on webhook retries.
 - Enable fast update/disable operations.
 - Provide audit trail.
 
 ### 7.5 Required IAM permissions (high level)
-Lambda execution role needs:
+
+**`connect-webhook-receiver` execution role**:
+- `sqs:SendMessage` on `connect-provisioning-queue`
+- CloudWatch Logs write permissions
+
+**`connect-provisioner-worker` execution role**:
 - Amazon Connect user management for target instances:
   - List/find users
   - Create user
@@ -212,7 +240,32 @@ Lambda execution role needs:
 - `ssm:GetParameter` for `/connect/macs/*` (and `kms:Decrypt` if encrypted)
 - DynamoDB read/write for `connect-provisioning-state`
 - Secrets Manager read for Okta API token
+- `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`, `sqs:ChangeMessageVisibility` on `connect-provisioning-queue` (automatically granted by CDK SQS event source)
 - CloudWatch Logs write permissions
+
+### 7.6 SQS Queue and DLQ
+
+**Main queue**: `connect-provisioning-queue`
+- Visibility timeout: 35 s (must exceed worker Lambda timeout of 30 s with margin)
+- Message retention: 4 days
+- Dead-letter queue: `connect-provisioning-dlq`, `maxReceiveCount: 3`
+
+**Dead-letter queue**: `connect-provisioning-dlq`
+- Message retention: 14 days (gives operators time to inspect and replay failures)
+
+**Message schema** (`ProvisioningTask`):
+```json
+{
+  "action": "ADDED | REMOVED | UNKNOWN",
+  "oktaUserId": "<Okta user ID>",
+  "groupName": "connect_noridian_agent",
+  "mac": "noridian",
+  "role": "agent | supervisor | admin",
+  "receivedAt": "<ISO 8601 timestamp>"
+}
+```
+
+**Rationale**: Okta Event Hooks require an HTTP 200 response within approximately 3 seconds. Amazon Connect API calls, Okta profile lookups, and DynamoDB writes can collectively exceed this window. SQS decouples the fast webhook acknowledgment from the slow provisioning work. The DLQ captures tasks that fail all retry attempts, enabling manual inspection and replay — critical for a government/healthcare environment (CMS MACs) where missed provisioning events have compliance implications.
 
 ---
 

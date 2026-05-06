@@ -1,35 +1,15 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 
 // ── AWS SDK clients (singleton) ──────────────────────────────────────────────
-const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const ssmClient = new SSMClient({});
-const secretsClient = new SecretsManagerClient({});
+const sqsClient = new SQSClient({});
 
 // ── Environment variables ─────────────────────────────────────────────────────
 const OKTA_BASE_URL = process.env.OKTA_BASE_URL ?? 'https://cms.okta.com';
-const SSM_CONFIG_PREFIX = process.env.SSM_CONFIG_PREFIX ?? '/connect/macs/';
-const STATE_TABLE_NAME = process.env.STATE_TABLE_NAME ?? 'connect-provisioning-state';
-const OKTA_API_TOKEN_SECRET_ARN = process.env.OKTA_API_TOKEN_SECRET_ARN ?? '';
+const PROVISIONING_QUEUE_URL = process.env.PROVISIONING_QUEUE_URL ?? '';
 const OKTA_SHARED_SECRET = process.env.OKTA_SHARED_SECRET ?? '';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-interface MacConfig {
-  mac: string;
-  instanceId: string;
-  usernameSource: 'email' | 'euaId';
-  routingProfileIdBaseline: string;
-  securityProfiles: {
-    agent: string;
-    supervisor: string;
-    admin: string;
-  };
-  hierarchyGroupId?: string;
-}
-
 interface ParsedGroup {
   mac: string;
   role: 'agent' | 'supervisor' | 'admin';
@@ -53,6 +33,16 @@ interface OktaEventHookPayload {
   target?: Array<{ type?: string; displayName?: string; id?: string; alternateId?: string }>;
 }
 
+/** Message schema written to SQS and consumed by the worker Lambda. */
+export interface ProvisioningTask {
+  action: 'ADDED' | 'REMOVED' | 'UNKNOWN';
+  oktaUserId: string;
+  groupName: string;
+  mac: string;
+  role: 'agent' | 'supervisor' | 'admin';
+  receivedAt: string;
+}
+
 // ── Group name parsing ────────────────────────────────────────────────────────
 const GROUP_PATTERN = /^connect_(?<mac>[a-z0-9]+)_(?<role>agent|supervisor|admin)$/;
 
@@ -63,54 +53,6 @@ function parseGroupName(groupName: string): ParsedGroup | null {
     mac: match.groups['mac'],
     role: match.groups['role'] as 'agent' | 'supervisor' | 'admin',
   };
-}
-
-// ── Security profile stacking ─────────────────────────────────────────────────
-function stackProfiles(
-  profiles: MacConfig['securityProfiles'],
-  role: 'agent' | 'supervisor' | 'admin',
-): string[] {
-  switch (role) {
-    case 'admin':
-      return [profiles.admin, profiles.supervisor, profiles.agent];
-    case 'supervisor':
-      return [profiles.supervisor, profiles.agent];
-    case 'agent':
-    default:
-      return [profiles.agent];
-  }
-}
-
-// ── SSM helper ────────────────────────────────────────────────────────────────
-async function loadMacConfig(mac: string): Promise<MacConfig> {
-  const paramName = `${SSM_CONFIG_PREFIX}${mac}`;
-  const response = await ssmClient.send(
-    new GetParameterCommand({ Name: paramName, WithDecryption: true }),
-  );
-  if (!response.Parameter?.Value) {
-    throw new Error(`SSM parameter ${paramName} is empty or missing`);
-  }
-  return JSON.parse(response.Parameter.Value) as MacConfig;
-}
-
-// ── DynamoDB helpers ──────────────────────────────────────────────────────────
-async function getState(pk: string) {
-  const result = await dynamoClient.send(
-    new GetCommand({ TableName: STATE_TABLE_NAME, Key: { pk } }),
-  );
-  return result.Item;
-}
-
-async function putState(
-  pk: string,
-  attrs: Record<string, unknown>,
-): Promise<void> {
-  await dynamoClient.send(
-    new PutCommand({
-      TableName: STATE_TABLE_NAME,
-      Item: { pk, updatedAt: new Date().toISOString(), ...attrs },
-    }),
-  );
 }
 
 // ── Shared secret validation ──────────────────────────────────────────────────
@@ -133,7 +75,7 @@ function safeLog(label: string, payload: unknown): void {
     }
     return value;
   });
-  console.log(`[connect-provisioner] ${label}: ${serialised}`);
+  console.log(`[connect-webhook-receiver] ${label}: ${serialised}`);
 }
 
 // ── Extract action + group name + user id from Okta payload ──────────────────
@@ -171,7 +113,7 @@ function parseOktaPayload(body: OktaEventHookPayload): {
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
-  // 1. Validate shared secret
+  // 1. Validate shared secret — return 401 immediately if invalid
   try {
     validateSharedSecret(event.headers as Record<string, string | undefined>);
   } catch {
@@ -206,9 +148,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     role: parsed?.role ?? null,
   };
 
-  // 5. If we cannot determine mac/role, return 200 (Okta requires 200 for delivery)
-  if (!parsed || !oktaUserId) {
-    safeLog('Cannot determine mac/role or user — skipping provisioning', responseBase);
+  // 5. If we cannot determine mac/role/user, return 200 (Okta requires 200 for delivery)
+  if (!parsed || !oktaUserId || !groupName) {
+    safeLog('Cannot determine mac/role or user — skipping enqueue', responseBase);
     return {
       statusCode: 200,
       body: JSON.stringify({ ...responseBase, message: 'Skipped: incomplete event data' }),
@@ -217,107 +159,41 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
   const { mac, role } = parsed;
 
+  // 6. Enqueue the provisioning task — all long-running work happens in the worker Lambda
+  const task: ProvisioningTask = {
+    action,
+    oktaUserId,
+    groupName,
+    mac,
+    role,
+    receivedAt: new Date().toISOString(),
+  };
+
   try {
-    // 6. Load MAC config from SSM
-    const config = await loadMacConfig(mac);
-
-    // TODO: fetch Okta user profile from Okta API
-    // const oktaUser = await fetchOktaUser(oktaUserId, await getOktaToken());
-    // const email = oktaUser.profile.email;
-    // const firstName = oktaUser.profile.firstName ?? '';
-    // const lastName = oktaUser.profile.lastName ?? '';
-    // const euaId = oktaUser.profile.euaId;
-    // const connectUsername = config.usernameSource === 'euaId' ? euaId : email;
-
-    // Placeholder until Okta API integration is complete
-    const connectUsername = `PLACEHOLDER_${oktaUserId}`;
-
-    const pk = `${mac}#${connectUsername}`;
-
-    if (action === 'ADDED') {
-      const existingState = await getState(pk);
-      const connectUserId: string | undefined =
-        (existingState?.connectUserId as string | undefined);
-
-      // TODO: look up Connect user by username if connectUserId not found in state
-      // const resolvedUserId = connectUserId ?? await findConnectUserByUsername(config.instanceId, connectUsername);
-
-      if (!connectUserId) {
-        // TODO: create user in Amazon Connect
-        // await connect.createUser({ InstanceId: config.instanceId, Username: connectUsername, ... });
-        console.log('[connect-provisioner] TODO: create Connect user', {
-          instanceId: config.instanceId,
-          connectUsername,
-          profiles: stackProfiles(config.securityProfiles, role),
-          routingProfile: config.routingProfileIdBaseline,
-        });
-      } else {
-        // TODO: update security profiles + routing profile
-        // await connect.updateUserSecurityProfiles({ InstanceId: config.instanceId, UserId: connectUserId, ... });
-        console.log('[connect-provisioner] TODO: update Connect user', {
-          instanceId: config.instanceId,
-          connectUserId,
-          profiles: stackProfiles(config.securityProfiles, role),
-        });
-      }
-
-      await putState(pk, {
-        mac,
-        oktaUserId,
-        connectUsername,
-        connectInstanceId: config.instanceId,
-        connectUserId: connectUserId ?? null,
-        currentRole: role,
-        status: 'PROVISIONED',
-      });
-    } else if (action === 'REMOVED') {
-      // TODO: call Okta API to verify user is no longer in any connect_{mac}_* group before disabling
-      // const groups = await listOktaUserGroups(oktaUserId, await getOktaToken());
-      // const stillHasAccess = groups.some(g => /^connect_{mac}_(agent|supervisor|admin)$/.test(g.profile.name));
-      // if (stillHasAccess) { return 200 with skip message }
-
-      // TODO: disable user in Amazon Connect
-      // await connect.updateUserIdentityInfo({ InstanceId: ..., UserId: ..., IdentityInfo: { ... } });
-      console.log('[connect-provisioner] TODO: disable Connect user for', { mac, oktaUserId });
-
-      await putState(pk, {
-        mac,
-        oktaUserId,
-        connectUsername,
-        connectInstanceId: config.instanceId,
-        connectUserId: null,
-        currentRole: role,
-        status: 'DISABLED',
-      });
-    }
-
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        ...responseBase,
-        message: `${action} event processed (stub)`,
-        connectUsername,
-      }),
-    };
+    await sqsClient.send(new SendMessageCommand({
+      QueueUrl: PROVISIONING_QUEUE_URL,
+      MessageBody: JSON.stringify(task),
+      // Group by MAC so messages for the same MAC are processed in order within the queue
+      MessageGroupId: mac,
+    }));
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    const isConfigError =
-      err instanceof Error && (err.message.includes('SSM') || err.message.includes('Missing'));
-
-    console.error('[connect-provisioner] Error processing event', { mac, role, action, message });
-
-    if (isConfigError) {
-      // Config/setup errors are permanent — return 200 so Okta does not retry
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ ...responseBase, message: 'Configuration error — check SSM/Secrets', error: message }),
-      };
-    }
-
-    // Transient errors (e.g., AWS SDK throttle) return 500 so Okta retries the hook
+    console.error('[connect-webhook-receiver] Failed to enqueue provisioning task', { mac, role, action, message });
+    // Return 500 so Okta retries delivery
     return {
       statusCode: 500,
-      body: JSON.stringify({ message: 'Transient error — please retry', error: message }),
+      body: JSON.stringify({ message: 'Failed to enqueue event — please retry', error: message }),
     };
   }
+
+  safeLog('Enqueued provisioning task', { mac, role, action, oktaUserId });
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ ...responseBase, message: 'Event accepted' }),
+  };
 }
+
+// OKTA_BASE_URL is referenced only to satisfy the env-var pattern used across both
+// Lambda packages and to allow future use (e.g., Okta verification challenge response).
+void OKTA_BASE_URL;
